@@ -1,0 +1,57 @@
+#!/bin/bash
+# ==========================================================
+# Enable BBR2 + fq_codel automatically
+# Works on Ubuntu 20.04 / 22.04 / 24.04 with Kernel 5.9+
+# ==========================================================
+
+set -euo pipefail
+
+echo ">>> Starting BBR2 + fq_codel setup..."
+
+# Require root
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo "Please run as root: sudo bash install"
+  exit 1
+fi
+
+# Load tcp_bbr2 module if available
+if ! lsmod | grep -q "^tcp_bbr2"; then
+  echo ">>> Loading tcp_bbr2 module..."
+  echo "tcp_bbr2" > /etc/modules-load.d/bbr2.conf || true
+  if ! modprobe tcp_bbr2 2>/dev/null; then
+    echo "ERROR: Your kernel does not support BBR2 (tcp_bbr2)."
+    exit 1
+  fi
+fi
+
+# Apply runtime settings
+echo ">>> Applying sysctl settings..."
+sysctl -w net.ipv4.tcp_congestion_control=bbr2
+sysctl -w net.core.default_qdisc=fq_codel
+
+# Make settings permanent
+echo ">>> Writing settings to /etc/sysctl.conf ..."
+sed -i '/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
+sed -i '/^net\.core\.default_qdisc/d' /etc/sysctl.conf
+cat <<'EOF' >> /etc/sysctl.conf
+
+# --- BBR2 + fq_codel ---
+net.ipv4.tcp_congestion_control=bbr2
+net.core.default_qdisc=fq_codel
+EOF
+
+# Reload sysctl
+sysctl -p >/dev/null
+
+# Show status
+echo ">>> Current status:"
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.core.default_qdisc
+if lsmod | grep -q "^tcp_bbr2"; then
+  echo ">>> BBR2 enabled successfully"
+else
+  echo ">>> BBR2 not enabled"
+  exit 1
+fi
+
+echo ">>> Done."
