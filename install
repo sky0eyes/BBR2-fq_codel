@@ -1,57 +1,92 @@
 #!/bin/bash
 # ==========================================================
-# Enable BBR2 + fq_codel automatically
-# Works on Ubuntu 20.04 / 22.04 / 24.04 with Kernel 5.9+
+# Auto-enable BBR2 if available, otherwise fall back to BBR,
+# and set fq_codel as default qdisc.
+# Ubuntu 20.04/22.04/24.04 (and similar) – Kernel 4.9+ (BBR), 5.9+ (BBR2)
 # ==========================================================
 
 set -euo pipefail
 
-echo ">>> Starting BBR2 + fq_codel setup..."
+log() { printf '%s\n' ">>> $*"; }
+err() { printf '%s\n' "ERROR: $*" 1>&2; }
 
-# Require root
+# --- prerequisites ---
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  echo "Please run as root: sudo bash install"
+  err "Please run as root, e.g. sudo bash install"
   exit 1
 fi
 
-# Load tcp_bbr2 module if available
-if ! lsmod | grep -q "^tcp_bbr2"; then
-  echo ">>> Loading tcp_bbr2 module..."
-  echo "tcp_bbr2" > /etc/modules-load.d/bbr2.conf || true
-  if ! modprobe tcp_bbr2 2>/dev/null; then
-    echo "ERROR: Your kernel does not support BBR2 (tcp_bbr2)."
-    exit 1
+# Try to load modules if they exist (ignore failures; some builds are built-in)
+modprobe tcp_bbr2 2>/dev/null || true
+modprobe tcp_bbr  2>/dev/null || true
+modprobe sch_fq_codel 2>/dev/null || true
+
+# Read available congestion controls
+AVAILABLE="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+if [ -z "${AVAILABLE}" ]; then
+  # Fallback read (rare)
+  if [ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]; then
+    AVAILABLE="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control)"
   fi
 fi
 
-# Apply runtime settings
-echo ">>> Applying sysctl settings..."
-sysctl -w net.ipv4.tcp_congestion_control=bbr2
-sysctl -w net.core.default_qdisc=fq_codel
-
-# Make settings permanent
-echo ">>> Writing settings to /etc/sysctl.conf ..."
-sed -i '/^net\.ipv4\.tcp_congestion_control/d' /etc/sysctl.conf
-sed -i '/^net\.core\.default_qdisc/d' /etc/sysctl.conf
-cat <<'EOF' >> /etc/sysctl.conf
-
-# --- BBR2 + fq_codel ---
-net.ipv4.tcp_congestion_control=bbr2
-net.core.default_qdisc=fq_codel
-EOF
-
-# Reload sysctl
-sysctl -p >/dev/null
-
-# Show status
-echo ">>> Current status:"
-sysctl net.ipv4.tcp_congestion_control
-sysctl net.core.default_qdisc
-if lsmod | grep -q "^tcp_bbr2"; then
-  echo ">>> BBR2 enabled successfully"
-else
-  echo ">>> BBR2 not enabled"
+if [ -z "${AVAILABLE}" ]; then
+  err "Cannot detect available TCP congestion controls."
   exit 1
 fi
 
-echo ">>> Done."
+log "Available congestion controls: ${AVAILABLE}"
+
+TARGET_CC=""
+case " ${AVAILABLE} " in
+  *" bbr2 "*) TARGET_CC="bbr2" ;;
+  *" bbr "*)  TARGET_CC="bbr"  ;;
+  *)          TARGET_CC=""     ;;
+esac
+
+if [ -z "${TARGET_CC}" ]; then
+  err "Neither bbr2 nor bbr is available on this kernel."
+  err "Install a newer kernel (e.g., mainline/HWE) and re-run."
+  exit 1
+fi
+
+log "Selecting congestion control: ${TARGET_CC}"
+
+# --- runtime apply ---
+log "Applying runtime sysctl..."
+sysctl -w net.ipv4.tcp_congestion_control="${TARGET_CC}" >/dev/null
+sysctl -w net.core.default_qdisc=fq_codel >/dev/null
+
+# --- persist in /etc/sysctl.conf (idempotent) ---
+log "Persisting settings to /etc/sysctl.conf ..."
+# Remove existing lines for these keys (any duplicates)
+sed -i -E '/^net\.ipv4\.tcp_congestion_control\s*=/d' /etc/sysctl.conf || true
+sed -i -E '/^net\.core\.default_qdisc\s*=/d'        /etc/sysctl.conf || true
+
+cat <<'EOF' >> /etc/sysctl.conf
+
+# --- BBR/BBR2 + fq_codel (managed by installer) ---
+net.ipv4.tcp_congestion_control=REPLACE_CC
+net.core.default_qdisc=fq_codel
+EOF
+
+# Replace placeholder with selected CC
+sed -i "s/^net\.ipv4\.tcp_congestion_control=REPLACE_CC/net.ipv4.tcp_congestion_control=${TARGET_CC}/" /etc/sysctl.conf
+
+# Reload sysctl
+sysctl -p >/dev/null || true
+
+# --- verify ---
+CUR_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+CUR_QD="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+
+log "Current:"
+printf '    net.ipv4.tcp_congestion_control = %s\n' "${CUR_CC}"
+printf '    net.core.default_qdisc         = %s\n' "${CUR_QD}"
+
+if [ "${CUR_CC}" = "${TARGET_CC}" ] && [ "${CUR_QD}" = "fq_codel" ]; then
+  log "Completed successfully."
+else
+  err "Settings not applied as expected. Please check dmesg/sysctl."
+  exit 1
+fi
